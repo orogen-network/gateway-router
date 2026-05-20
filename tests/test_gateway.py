@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 import httpx
@@ -19,6 +20,7 @@ from mining_types import (
     generate_keypair,
 )
 
+import gateway_router.app as gateway_app
 from gateway_router import GatewayConfig, build_app
 from gateway_router.batcher import BatchBuilder
 from gateway_router.catalog import OperatorCatalog
@@ -157,6 +159,35 @@ def test_public_routes_require_auth(config: GatewayConfig) -> None:
         assert r.status_code == 401
 
 
+def test_production_requires_redis_nonce_backend(
+    monkeypatch: pytest.MonkeyPatch, config: GatewayConfig,
+) -> None:
+    monkeypatch.setenv("OROGEN_ENV", "production")
+    with pytest.raises(RuntimeError, match="GATEWAY_NONCE_BACKEND=redis"):
+        build_app(config)
+
+
+def test_production_wires_redis_nonce_backend(
+    monkeypatch: pytest.MonkeyPatch, config: GatewayConfig,
+) -> None:
+    class FakeRedisNonceVault(NonceVault):
+        seen: list[tuple[str, str, int]] = []
+
+        def __init__(self, gateway_id: str, redis_url: str, ttl_ms: int) -> None:
+            self.seen.append((gateway_id, redis_url, ttl_ms))
+            super().__init__(gateway_id=gateway_id, ttl_ms=ttl_ms)
+
+    monkeypatch.setenv("OROGEN_ENV", "production")
+    monkeypatch.setenv("GATEWAY_NONCE_BACKEND", "redis")
+    monkeypatch.setenv("GATEWAY_REDIS_URL", "redis://redis.test:6379/0")
+    monkeypatch.setattr(gateway_app, "RedisNonceVault", FakeRedisNonceVault)
+    app = build_app(config)
+    assert isinstance(app.state.vault, FakeRedisNonceVault)
+    assert FakeRedisNonceVault.seen == [
+        ("gw-test", "redis://redis.test:6379/0", config.nonce_ttl_ms)
+    ]
+
+
 def test_heartbeat_then_catalog(config: GatewayConfig) -> None:
     app = build_app(config)
     with TestClient(app) as client:
@@ -241,37 +272,41 @@ def test_chat_routes_to_mocked_worker(config: GatewayConfig) -> None:
             json=hb.model_dump(mode="json"),
             headers=_internal_headers(),
         )
-        # Build a properly-signed receipt that the upstream will return.
-        signed_receipt = Receipt(
-            version=1,
-            job_id="j-1",
-            operator_id="op-1",
-            model_id="mock-model-7b",
-            model_weight_hash="w",
-            customer_nonce="n",
-            request_hash="rq",
-            response_hash="rs",
-            log_probs_sample=[-0.1, -0.2],
-            kernel_pack_hash="k",
-            gpu_model="mock-H100",
-            driver_version="550.54",
-            cuda_version="12.4",
-            attestation_report_hash="a",
-            batch_invariant_proof=None,
-            timestamp_ms=1,
-            gateway_id="gw-test",
-        ).sign(priv)
-        upstream_body = {
-            "id": "j-1",
-            "object": "chat.completion",
-            "model": "mock-model-7b",
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "receipt": signed_receipt.model_dump(mode="json"),
-        }
+        def _upstream(request: httpx.Request) -> httpx.Response:
+            assert request.headers["authorization"] == f"Bearer {INTERNAL_TOKEN}"
+            upstream_req = json.loads(request.content)
+            signed_receipt = Receipt(
+                version=1,
+                job_id="j-1",
+                operator_id="op-1",
+                model_id=upstream_req["model"],
+                model_weight_hash="w",
+                customer_nonce=upstream_req["customer_nonce"],
+                request_hash="rq",
+                response_hash="rs",
+                log_probs_sample=[-0.1, -0.2],
+                kernel_pack_hash="k",
+                gpu_model="mock-H100",
+                driver_version="550.54",
+                cuda_version="12.4",
+                attestation_report_hash="a",
+                batch_invariant_proof=None,
+                timestamp_ms=1,
+                gateway_id="gw-test",
+            ).sign(priv)
+            upstream_body = {
+                "id": "j-1",
+                "object": "chat.completion",
+                "model": "mock-model-7b",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "receipt": signed_receipt.model_dump(mode="json"),
+            }
+            return httpx.Response(200, json=upstream_body)
+
         with respx.mock(assert_all_called=True) as mocker:
             mocker.post("http://127.0.0.1:65535/v1/chat/completions").mock(
-                return_value=httpx.Response(200, json=upstream_body),
+                side_effect=_upstream,
             )
             r = client.post(
                 "/v1/chat/completions",
@@ -287,3 +322,105 @@ def test_chat_routes_to_mocked_worker(config: GatewayConfig) -> None:
         r2 = client.post("/internal/seal_batch", headers=_internal_headers())
         assert r2.status_code == 200
         assert r2.json()["receipt_count"] == 1
+
+
+def test_chat_rejects_consumed_nonce_before_routing(config: GatewayConfig) -> None:
+    app = build_app(config)
+    with TestClient(app) as client:
+        priv, pub = generate_keypair()
+        hb = OffChainHeartbeat(
+            operator_id="op-1",
+            capabilities=[Capability(base_model_id="mock-model-7b")],
+            current_load=LoadSnapshot(),
+            attestation_freshness=AttestationFreshness(
+                last_attested_at_ms=int(time.time() * 1000),
+                expires_at_ms=int(time.time() * 1000) + 86400000,
+                current_report_hash="ab" * 32,
+            ),
+            watchdog_state=WatchdogState(),
+            endpoint_url="http://127.0.0.1:65535",
+            price_per_million_tokens=1000,
+            geo_region="US",
+        ).sign(priv)
+        app.state.registry.register("op-1", pub)
+        client.post(
+            "/internal/heartbeat",
+            json=hb.model_dump(mode="json"),
+            headers=_internal_headers(),
+        )
+        issued = client.post("/v1/nonces", headers=_public_headers()).json()["nonce"]
+        assert app.state.vault.claim(issued)
+        r = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "mock-model-7b",
+                "messages": [{"role": "user", "content": "hi"}],
+                "customer_nonce": issued,
+            },
+            headers=_public_headers(),
+        )
+        assert r.status_code == 400
+
+
+def test_chat_rejects_receipt_nonce_mismatch(config: GatewayConfig) -> None:
+    app = build_app(config)
+    with TestClient(app) as client:
+        priv, pub = generate_keypair()
+        hb = OffChainHeartbeat(
+            operator_id="op-1",
+            capabilities=[Capability(base_model_id="mock-model-7b")],
+            current_load=LoadSnapshot(),
+            attestation_freshness=AttestationFreshness(
+                last_attested_at_ms=int(time.time() * 1000),
+                expires_at_ms=int(time.time() * 1000) + 86400000,
+                current_report_hash="ab" * 32,
+            ),
+            watchdog_state=WatchdogState(),
+            endpoint_url="http://127.0.0.1:65535",
+            price_per_million_tokens=1000,
+            geo_region="US",
+        ).sign(priv)
+        app.state.registry.register("op-1", pub)
+        client.post(
+            "/internal/heartbeat",
+            json=hb.model_dump(mode="json"),
+            headers=_internal_headers(),
+        )
+        bad_receipt = Receipt(
+            version=1,
+            job_id="j-1",
+            operator_id="op-1",
+            model_id="mock-model-7b",
+            model_weight_hash="w",
+            customer_nonce="0x" + "ff" * 32,
+            request_hash="rq",
+            response_hash="rs",
+            log_probs_sample=[-0.1],
+            kernel_pack_hash="k",
+            attestation_report_hash="a",
+            timestamp_ms=1,
+            gateway_id="gw-test",
+        ).sign(priv)
+        with respx.mock(assert_all_called=True) as mocker:
+            mocker.post("http://127.0.0.1:65535/v1/chat/completions").mock(
+                return_value=httpx.Response(
+                    200,
+                    json={
+                        "id": "j-1",
+                        "object": "chat.completion",
+                        "model": "mock-model-7b",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello"}}],
+                        "receipt": bad_receipt.model_dump(mode="json"),
+                    },
+                ),
+            )
+            r = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "mock-model-7b",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers=_public_headers(),
+            )
+        assert r.status_code == 502
+        assert "customer_nonce" in r.text

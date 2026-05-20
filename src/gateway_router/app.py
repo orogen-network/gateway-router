@@ -40,7 +40,7 @@ from gateway_router.auth import (
 from gateway_router.batcher import BatchBuilder
 from gateway_router.catalog import OperatorCatalog
 from gateway_router.config import GatewayConfig
-from gateway_router.nonces import NonceVault
+from gateway_router.nonces import NonceStore, NonceVault, RedisNonceVault
 from gateway_router.registry import OperatorRegistry
 
 # Cap on the size of the upstream JSON response we will buffer before rejecting
@@ -68,9 +68,27 @@ def _allow_http_localhost() -> bool:
     return os.environ.get("OROGEN_ENV", "").lower() != "production"
 
 
+def _worker_auth_headers() -> dict[str, str]:
+    token = (
+        os.environ.get("WORKER_API_TOKEN", "")
+        or os.environ.get("INTERNAL_AUTH_TOKEN", "")
+    ).strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def build_app(config: GatewayConfig) -> FastAPI:
     # Fail-closed startup check for internal token in production.
     require_internal_token()
+    env = os.environ.get("OROGEN_ENV", "").lower()
+    nonce_backend = os.environ.get("GATEWAY_NONCE_BACKEND", "").lower()
+    redis_url = (
+        os.environ.get("GATEWAY_REDIS_URL", "")
+        or os.environ.get("REDIS_URL", "")
+    ).strip()
+    if env == "production" and nonce_backend != "redis":
+        raise RuntimeError("production gateway requires GATEWAY_NONCE_BACKEND=redis")
+    if nonce_backend == "redis" and not redis_url:
+        raise RuntimeError("GATEWAY_REDIS_URL or REDIS_URL is required for Redis nonce backend")
 
     app = FastAPI(title="gateway-router", version="0.1.0")
     # Trust only configured hosts; "*" is fine for dev, locked in prod.
@@ -82,7 +100,15 @@ def build_app(config: GatewayConfig) -> FastAPI:
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
 
     catalog = OperatorCatalog()
-    vault = NonceVault(gateway_id=config.gateway_id, ttl_ms=config.nonce_ttl_ms)
+    vault: NonceStore
+    if nonce_backend == "redis":
+        vault = RedisNonceVault(
+            gateway_id=config.gateway_id,
+            ttl_ms=config.nonce_ttl_ms,
+            redis_url=redis_url,
+        )
+    else:
+        vault = NonceVault(gateway_id=config.gateway_id, ttl_ms=config.nonce_ttl_ms)
     batcher = BatchBuilder(
         gateway_id=config.gateway_id,
         gateway_private_key_hex=config.gateway_private_key(),
@@ -189,9 +215,18 @@ def build_app(config: GatewayConfig) -> FastAPI:
         if nonce is None:
             nonce = vault.issue().nonce
         else:
-            # If the customer brought a nonce, accept only if it came from us.
+            # If the customer brought a nonce, accept only if it came from us
+            # and is still unused/unexpired.
             if not vault.is_known(nonce):
-                raise HTTPException(status_code=400, detail="unknown nonce")
+                raise HTTPException(
+                    status_code=400,
+                    detail="unknown, expired, or consumed nonce",
+                )
+        if not vault.claim(nonce):
+            raise HTTPException(
+                status_code=409,
+                detail="nonce already consumed or expired",
+            )
 
         upstream = {
             "model": req.model,
@@ -219,6 +254,7 @@ def build_app(config: GatewayConfig) -> FastAPI:
                 upstream_resp = await client.post(
                     f"{rec.endpoint_url}/v1/chat/completions",
                     json=upstream,
+                    headers=_worker_auth_headers(),
                 )
             except httpx.HTTPError as exc:
                 raise HTTPException(
@@ -250,13 +286,27 @@ def build_app(config: GatewayConfig) -> FastAPI:
 
         # MED-SVC-011 / CRIT-SVC-002: verify the receipt's operator_id matches
         # the operator we routed to AND that the receipt is signed by them.
+        receipt_mismatch: dict[str, str] = {}
         if receipt.operator_id != rec.operator_id:
+            receipt_mismatch["operator_id"] = (
+                f"routed={rec.operator_id!r} got={receipt.operator_id!r}"
+            )
+        if receipt.customer_nonce != nonce:
+            receipt_mismatch["customer_nonce"] = (
+                f"expected={nonce!r} got={receipt.customer_nonce!r}"
+            )
+        if receipt.model_id != req.model:
+            receipt_mismatch["model_id"] = (
+                f"expected={req.model!r} got={receipt.model_id!r}"
+            )
+        if receipt.gateway_id != config.gateway_id:
+            receipt_mismatch["gateway_id"] = (
+                f"expected={config.gateway_id!r} got={receipt.gateway_id!r}"
+            )
+        if receipt_mismatch:
             raise HTTPException(
                 status_code=502,
-                detail=(
-                    f"receipt operator mismatch: routed={rec.operator_id!r} "
-                    f"got={receipt.operator_id!r}"
-                ),
+                detail={"receipt_mismatch": receipt_mismatch},
             )
         op_pubkey = registry.get(receipt.operator_id)
         if op_pubkey is None:
@@ -271,7 +321,6 @@ def build_app(config: GatewayConfig) -> FastAPI:
                 status_code=502,
                 detail="upstream receipt has invalid operator signature",
             )
-        vault.claim(nonce)  # mark as used
         batcher.add(receipt, operator_pubkey=op_pubkey)
         body["gateway_id"] = config.gateway_id
         body["nonce_used"] = nonce
