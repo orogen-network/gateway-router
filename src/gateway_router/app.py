@@ -41,6 +41,9 @@ from mining_types import Capability, OffChainHeartbeat, Receipt, verify_ed25519
 from pydantic import BaseModel
 
 from gateway_router.auth import (
+    allow_insecure_operator_endpoints,
+    key_mint_rate_limit_ok,
+    mint_testnet_key,
     require_internal_auth,
     require_internal_token,
     require_public_auth,
@@ -188,6 +191,7 @@ def build_app(config: GatewayConfig) -> FastAPI:
                 validate_endpoint_url(
                     hb.endpoint_url,
                     allow_http_localhost=_allow_http_localhost(),
+                    allow_insecure_http=allow_insecure_operator_endpoints(),
                 )
             except ValueError as exc:
                 raise HTTPException(
@@ -259,6 +263,7 @@ def build_app(config: GatewayConfig) -> FastAPI:
                 validate_endpoint_url(
                     endpoint_url,
                     allow_http_localhost=_allow_http_localhost(),
+                    allow_insecure_http=allow_insecure_operator_endpoints(),
                 )
             except ValueError as exc:
                 raise HTTPException(
@@ -304,6 +309,29 @@ def build_app(config: GatewayConfig) -> FastAPI:
                 }
                 for r in catalog.all()
             ]
+        }
+
+    @app.post("/v1/keys")
+    async def issue_key(request: Request) -> dict[str, Any]:
+        """Self-serve testnet API-key faucet (unauthenticated, IP rate-limited).
+
+        Mints a fresh, clearly testnet-scoped key that immediately authorizes
+        the public `/v1/*` routes. Stored in Redis when configured, else in an
+        in-process set. No identity required — this is a Forge testnet faucet.
+        """
+        source_ip = request.client.host if request.client else "unknown"
+        if not key_mint_rate_limit_ok(source_ip):
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="too many key requests from this source; try again later",
+            )
+        api_key = mint_testnet_key()
+        return {
+            "api_key": api_key,
+            "note": (
+                "Orogen Forge TESTNET key — no quota/billing, may be reset at any "
+                "time. Use as a Bearer token against /v1/* on this gateway."
+            ),
         }
 
     @app.post("/v1/nonces", dependencies=[Depends(require_public_auth)])
@@ -372,6 +400,7 @@ def build_app(config: GatewayConfig) -> FastAPI:
             validate_endpoint_url(
                 rec.endpoint_url,
                 allow_http_localhost=_allow_http_localhost(),
+                allow_insecure_http=allow_insecure_operator_endpoints(),
             )
         except ValueError as exc:
             raise HTTPException(

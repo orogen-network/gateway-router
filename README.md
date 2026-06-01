@@ -5,6 +5,25 @@ RFC-0003 heartbeats), enforces RFC-0007-shape nonces, routes each chat completio
 to a capable operator, and aggregates returned receipts into RFC-0004 settlement
 batches.
 
+## Self-serve testnet API key
+
+On the Forge testnet, customers mint their own API key — no signup, no shared
+secret:
+
+```
+POST https://gateway.orogen.network/v1/keys
+-> { "api_key": "orogen-testnet-…", "note": "…" }
+```
+
+The returned key is a testnet-scoped bearer accepted on all `/v1/*` routes
+(alongside any statically configured `PUBLIC_API_TOKENS`). The mint endpoint is
+unauthenticated and rate-limited per source IP. Keys are stored in Redis when
+the gateway is configured with one, else in-process (reset on restart).
+
+`GATEWAY_ALLOW_INSECURE_OPERATOR_ENDPOINTS=true` (default false, testnet only)
+lets the gateway route to a plain-http operator worker without verifying TLS;
+the SSRF allow-list still applies.
+
 ## Operator heartbeat (no shared secret)
 
 External operators enter the routing catalog by signing a heartbeat with the

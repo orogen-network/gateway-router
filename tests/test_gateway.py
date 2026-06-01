@@ -490,6 +490,104 @@ def test_operator_heartbeat_no_shared_secret_needed(config: GatewayConfig) -> No
         assert r.status_code == 200, r.text
 
 
+# ---------------------------------------------------------------------------
+# Self-serve testnet key faucet (POST /v1/keys)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _reset_key_state() -> None:
+    """Clear the in-process key store + rate-limiter between tests."""
+    import gateway_router.auth as auth_mod
+
+    auth_mod._INPROC_TESTNET_KEYS.clear()
+    auth_mod._key_mint_hits.clear()
+    yield
+    auth_mod._INPROC_TESTNET_KEYS.clear()
+    auth_mod._key_mint_hits.clear()
+
+
+def test_issue_key_mints_testnet_scoped_key(config: GatewayConfig) -> None:
+    app = build_app(config)
+    with TestClient(app) as client:
+        r = client.post("/v1/keys")
+        assert r.status_code == 200, r.text
+        body = r.json()
+        key = body["api_key"]
+        assert key.startswith("orogen-testnet-")
+        assert "note" in body and body["note"]
+
+
+def test_self_issued_key_authorizes_v1(config: GatewayConfig) -> None:
+    """A freshly minted key must authorize a public /v1 route.
+
+    With PUBLIC_API_TOKENS set, the wrong/no bearer is rejected (401) but the
+    self-issued key is accepted.
+    """
+    app = build_app(config)
+    with TestClient(app) as client:
+        key = client.post("/v1/keys").json()["api_key"]
+        # The wrong bearer is still rejected.
+        bad = client.post(
+            "/v1/nonces", headers={"Authorization": "Bearer not-a-real-key"}
+        )
+        assert bad.status_code == 401
+        # The minted key authorizes the call.
+        ok = client.post("/v1/nonces", headers={"Authorization": f"Bearer {key}"})
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["nonce"]
+
+
+def test_key_mint_rate_limit_triggers(
+    config: GatewayConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import gateway_router.auth as auth_mod
+
+    monkeypatch.setattr(auth_mod, "_KEY_MINT_MAX_PER_WINDOW", 3)
+    app = build_app(config)
+    with TestClient(app) as client:
+        for _ in range(3):
+            assert client.post("/v1/keys").status_code == 200
+        # The 4th request from the same source IP is rate-limited.
+        r = client.post("/v1/keys")
+        assert r.status_code == 429, r.text
+
+
+def test_allow_insecure_operator_endpoints_flag_plumbing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The testnet flag flips TLS verification + http endpoint acceptance."""
+    from gateway_router.auth import (
+        allow_insecure_operator_endpoints,
+        safe_httpx_client,
+        validate_endpoint_url,
+    )
+
+    # Default false: rejects plain http to a public host, builds a TLS-verifying
+    # client.
+    monkeypatch.delenv("GATEWAY_ALLOW_INSECURE_OPERATOR_ENDPOINTS", raising=False)
+    assert allow_insecure_operator_endpoints() is False
+    # Client builds without error in the default (verifying) configuration.
+    _client = safe_httpx_client(5.0)
+    assert _client is not None
+    with pytest.raises(ValueError, match="https"):
+        validate_endpoint_url("http://example.com:8100")
+
+    # Flag on: plain http to a public host is allowed (still SSRF-checked) and
+    # the outbound client disables TLS verification.
+    monkeypatch.setenv("GATEWAY_ALLOW_INSECURE_OPERATOR_ENDPOINTS", "true")
+    assert allow_insecure_operator_endpoints() is True
+    # Public host over http now passes validation.
+    validate_endpoint_url(
+        "http://example.com:8100", allow_insecure_http=True
+    )
+    # But SSRF targets are still rejected even with the flag.
+    with pytest.raises(ValueError, match="forbidden"):
+        validate_endpoint_url(
+            "http://169.254.169.254/latest", allow_insecure_http=True
+        )
+
+
 def test_chat_rejects_receipt_nonce_mismatch(config: GatewayConfig) -> None:
     app = build_app(config)
     with TestClient(app) as client:
