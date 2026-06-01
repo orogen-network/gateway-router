@@ -3,16 +3,24 @@
 Endpoints:
 - `POST /v1/chat/completions` — OpenAI-compatible; routes to a worker.
 - `POST /v1/nonces` — issue a fresh nonce challenge.
-- `POST /internal/heartbeat` — operator heartbeat ingest.
+- `POST /v1/operator/heartbeat` — per-operator, sr25519-authenticated heartbeat
+  ingest (NO shared secret; the operator proves ownership of their ss58 hotkey).
+- `POST /internal/heartbeat` — foundation/admin heartbeat ingest (shared bearer).
 - `GET  /internal/catalog` — current operator catalog.
 - `POST /internal/seal_batch` — produce a `SettlementBatch` from buffered receipts.
 - `GET  /healthz`
 
 Security model:
 - `/internal/*` routes are gated by a shared bearer (`INTERNAL_AUTH_TOKEN` env).
-- `/v1/*` routes are gated by `PUBLIC_API_TOKENS` (csv env) when configured.
-- Heartbeats are verified Ed25519-signed by the operator (pubkey from
-  `OperatorRegistry`).
+  This shared secret is reserved for foundation/admin endpoints (catalog admin,
+  seal_batch, the legacy admin heartbeat) — NOT for ordinary operator liveness.
+- `/v1/operator/heartbeat` lets any operator enter the routing catalog by signing
+  their heartbeat with the sr25519 key behind their ss58 hotkey (domain-prefixed
+  BLAKE2 scheme, matching wallet-sdk-core / wallet-cli). No shared secret needed.
+- `/v1/*` (chat/nonces) routes are gated by `PUBLIC_API_TOKENS` (csv env) when
+  configured.
+- Legacy `/internal/heartbeat` payloads are verified Ed25519-signed by the
+  operator (pubkey from `OperatorRegistry`).
 - Receipts proxied back by upstreams are verified against the routed operator's
   pubkey before being added to the settlement batch.
 - Operator `endpoint_url` is validated against an SSRF allow-list before being
@@ -21,13 +29,15 @@ Security model:
 
 from __future__ import annotations
 
+import json
 import os
+import time
 from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from mining_types import OffChainHeartbeat, Receipt, verify_ed25519
+from mining_types import Capability, OffChainHeartbeat, Receipt, verify_ed25519
 from pydantic import BaseModel
 
 from gateway_router.auth import (
@@ -41,6 +51,12 @@ from gateway_router.batcher import BatchBuilder
 from gateway_router.catalog import OperatorCatalog
 from gateway_router.config import GatewayConfig
 from gateway_router.nonces import NonceStore, NonceVault, RedisNonceVault
+from gateway_router.operator_auth import (
+    OperatorAuthError,
+    is_registered_onchain,
+    require_onchain_operator,
+    verify_heartbeat_signature,
+)
 from gateway_router.registry import OperatorRegistry
 
 # Cap on the size of the upstream JSON response we will buffer before rejecting
@@ -61,6 +77,26 @@ class ChatRequest(BaseModel):
     customer_nonce: str | None = None
     max_price: int | None = None
     region: str | None = None
+
+
+# Max size of the raw signed heartbeat body we will verify (bounds the work an
+# unauthenticated caller can force on the sr25519 verifier).
+MAX_OPERATOR_HEARTBEAT_BYTES = 16 * 1024  # 16 KiB
+
+
+class OperatorHeartbeatRequest(BaseModel):
+    """Per-operator signed heartbeat for the public, secret-free ingest path.
+
+    `heartbeat_json` is the EXACT UTF-8 JSON string the operator signed (its
+    bytes — not a re-serialized copy — are what the sr25519 signature covers, so
+    JSON key ordering can never desync sign and verify). It MUST decode to an
+    object carrying at least `operator_ss58`; the gateway also reads optional
+    routing fields (`endpoint_url`, `models`, `price_per_million_tokens`,
+    `geo_region`) so the operator can advertise what it serves.
+    """
+
+    heartbeat_json: str
+    signature: str
 
 
 def _allow_http_localhost() -> bool:
@@ -160,6 +196,99 @@ def build_app(config: GatewayConfig) -> FastAPI:
                 ) from exc
         catalog.upsert(hb)
         return {"ok": True, "operators": len(catalog.all())}
+
+    @app.post("/v1/operator/heartbeat")
+    async def operator_heartbeat(req: OperatorHeartbeatRequest) -> dict[str, Any]:
+        """Public, secret-free operator liveness ingest.
+
+        The operator authenticates by signing its heartbeat with the sr25519
+        key behind its ss58 hotkey — NO shared `INTERNAL_AUTH_TOKEN` required.
+        On a valid signature (and, when enabled, a confirmed on-chain
+        registration) the operator is admitted to the routing catalog.
+        """
+        body = req.heartbeat_json.encode("utf-8")
+        if len(body) > MAX_OPERATOR_HEARTBEAT_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="operator heartbeat body too large",
+            )
+        try:
+            payload = json.loads(req.heartbeat_json)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"heartbeat_json is not valid JSON: {exc}",
+            ) from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="heartbeat_json must decode to a JSON object",
+            )
+        operator_ss58 = str(payload.get("operator_ss58") or "").strip()
+        if not operator_ss58:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="heartbeat_json missing operator_ss58",
+            )
+        # Verify the domain-prefixed sr25519 signature over the exact bytes.
+        try:
+            verify_heartbeat_signature(operator_ss58, body, req.signature)
+        except OperatorAuthError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"operator signature rejected: {exc}",
+            ) from exc
+        # Optional on-chain gate (off by default for bring-up).
+        if require_onchain_operator():
+            try:
+                ok = is_registered_onchain(operator_ss58)
+            except OperatorAuthError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=f"on-chain operator check failed: {exc}",
+                ) from exc
+            if not ok:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"operator {operator_ss58} is not registered on-chain",
+                )
+        # Optional routing fields; the ss58 hotkey IS the operator id.
+        endpoint_url = str(payload.get("endpoint_url") or "").strip()
+        if endpoint_url:
+            try:
+                validate_endpoint_url(
+                    endpoint_url,
+                    allow_http_localhost=_allow_http_localhost(),
+                )
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"endpoint_url rejected: {exc}",
+                ) from exc
+        models = payload.get("models") or payload.get("base_models") or []
+        if not isinstance(models, list):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="models must be a list of base_model_id strings",
+            )
+        capabilities = [
+            Capability(base_model_id=str(m)) for m in models if str(m).strip()
+        ]
+        hb = OffChainHeartbeat(
+            operator_id=operator_ss58,
+            capabilities=capabilities,
+            endpoint_url=endpoint_url,
+            price_per_million_tokens=int(payload.get("price_per_million_tokens") or 0),
+            geo_region=str(payload.get("geo_region") or "US"),
+        )
+        catalog.upsert(hb)
+        return {
+            "ok": True,
+            "operator_id": operator_ss58,
+            "operators": len(catalog.all()),
+            "advertised_models": sorted({c.base_model_id for c in capabilities}),
+            "verified_at_ms": int(time.time() * 1000),
+        }
 
     @app.get("/internal/catalog", dependencies=[Depends(require_internal_auth)])
     async def get_catalog() -> dict[str, Any]:

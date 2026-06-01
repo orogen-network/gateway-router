@@ -12,6 +12,8 @@ dependencies = [
     "pydantic>=2.7,<3.0",
     "redis>=5.0",
     "mining-types",
+    # sr25519 verification for the per-operator (secret-free) heartbeat path.
+    "py-sr25519-bindings>=0.2",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +23,12 @@ dev = [
     "respx>=0.21",
     "ruff>=0.4",
     "mypy>=1.10",
+]
+# Optional: confirm operators are staked on-chain before catalog entry
+# (enabled with GATEWAY_REQUIRE_ONCHAIN_OPERATOR). Kept out of the default
+# install so bring-up stays dependency-light.
+onchain = [
+    "substrate-interface>=1.7",
 ]
 
 [build-system]
