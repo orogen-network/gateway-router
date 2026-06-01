@@ -36,6 +36,7 @@ from typing import Any
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from mining_types import Capability, OffChainHeartbeat, Receipt, verify_ed25519
 from pydantic import BaseModel
@@ -137,6 +138,26 @@ def build_app(config: GatewayConfig) -> FastAPI:
         if h.strip()
     ] or ["*"]
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts)
+
+    # Browser CORS for the customer-console SPA. Kept tight: only the known
+    # Orogen frontends, only the methods/headers the customer routes
+    # (/v1/keys, /v1/chat/completions, /v1/nonces) actually need. Never "*".
+    cors_origins = [
+        o.strip()
+        for o in os.environ.get(
+            "CUSTOMER_CORS_ORIGINS",
+            "https://app.orogen.network,https://orogen.network",
+        ).split(",")
+        if o.strip()
+    ]
+    if cors_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_methods=["GET", "POST", "OPTIONS"],
+            allow_headers=["authorization", "content-type"],
+            max_age=600,
+        )
 
     catalog = OperatorCatalog()
     vault: NonceStore

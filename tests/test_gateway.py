@@ -650,3 +650,48 @@ def test_chat_rejects_receipt_nonce_mismatch(config: GatewayConfig) -> None:
             )
         assert r.status_code == 502
         assert "customer_nonce" in r.text
+
+
+# ---------------------------------------------------------------------------
+# Browser CORS for the customer-console SPA
+# ---------------------------------------------------------------------------
+
+_ALLOWED_ORIGIN = "https://app.orogen.network"
+
+
+def test_cors_allows_console_origin_on_keys(config: GatewayConfig) -> None:
+    app = build_app(config)
+    with TestClient(app) as client:
+        r = client.post("/v1/keys", headers={"Origin": _ALLOWED_ORIGIN})
+        assert r.status_code == 200, r.text
+        assert r.headers.get("access-control-allow-origin") == _ALLOWED_ORIGIN
+
+
+def test_cors_preflight_for_chat_completions(config: GatewayConfig) -> None:
+    app = build_app(config)
+    with TestClient(app) as client:
+        r = client.options(
+            "/v1/chat/completions",
+            headers={
+                "Origin": _ALLOWED_ORIGIN,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+        assert r.status_code in (200, 204), r.text
+        assert r.headers.get("access-control-allow-origin") == _ALLOWED_ORIGIN
+        assert "POST" in r.headers.get("access-control-allow-methods", "")
+
+
+def test_cors_rejects_unknown_origin(config: GatewayConfig) -> None:
+    app = build_app(config)
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/keys", headers={"Origin": "https://evil.example.com"}
+        )
+        # The request still succeeds (CORS is a browser-enforced policy) but the
+        # gateway must NOT echo an allow-origin header for an unknown origin.
+        assert r.status_code == 200
+        assert "access-control-allow-origin" not in {
+            k.lower() for k in r.headers
+        }
