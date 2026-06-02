@@ -146,7 +146,7 @@ def build_app(config: GatewayConfig) -> FastAPI:
         o.strip()
         for o in os.environ.get(
             "CUSTOMER_CORS_ORIGINS",
-            "https://app.orogen.network,https://orogen.network",
+            "https://app.orogen.network,https://orogen.network,https://onboarding.orogen.network",
         ).split(",")
         if o.strip()
     ]

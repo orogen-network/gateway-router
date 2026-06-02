@@ -683,6 +683,20 @@ def test_cors_preflight_for_chat_completions(config: GatewayConfig) -> None:
         assert "POST" in r.headers.get("access-control-allow-methods", "")
 
 
+def test_cors_allows_onboarding_origin_on_healthz(config: GatewayConfig) -> None:
+    app = build_app(config)
+    with TestClient(app) as client:
+        r = client.get(
+            "/healthz",
+            headers={"Origin": "https://onboarding.orogen.network"},
+        )
+        assert r.status_code == 200, r.text
+        assert (
+            r.headers.get("access-control-allow-origin")
+            == "https://onboarding.orogen.network"
+        )
+
+
 def test_cors_rejects_unknown_origin(config: GatewayConfig) -> None:
     app = build_app(config)
     with TestClient(app) as client:
