@@ -448,6 +448,45 @@ def test_operator_heartbeat_enters_catalog(config: GatewayConfig) -> None:
         assert any(o["operator_id"] == ss58 for o in cat["operators"])
 
 
+def test_operator_heartbeat_registers_receipt_pubkey(config: GatewayConfig) -> None:
+    app = build_app(config)
+    with TestClient(app) as client:
+        pub, priv, ss58 = _new_operator()
+        _receipt_priv, receipt_pub = generate_keypair()
+        body = _operator_body(
+            ss58,
+            endpoint_url="http://127.0.0.1:65535",
+            models=["mock-model-7b"],
+            receipt_pubkey_hex=receipt_pub,
+        )
+        sig = _sign_heartbeat_body(pub, priv, body)
+
+        r = client.post(
+            "/v1/operator/heartbeat",
+            json={"heartbeat_json": body, "signature": sig},
+        )
+
+        assert r.status_code == 200, r.text
+        assert r.json()["receipt_pubkey_registered"] is True
+        assert app.state.registry.get(ss58) == receipt_pub
+
+
+def test_operator_heartbeat_rejects_bad_receipt_pubkey(config: GatewayConfig) -> None:
+    app = build_app(config)
+    with TestClient(app) as client:
+        pub, priv, ss58 = _new_operator()
+        body = _operator_body(ss58, receipt_pubkey_hex="not-hex")
+        sig = _sign_heartbeat_body(pub, priv, body)
+
+        r = client.post(
+            "/v1/operator/heartbeat",
+            json={"heartbeat_json": body, "signature": sig},
+        )
+
+        assert r.status_code == 400
+        assert "receipt_pubkey_hex" in r.json()["detail"]
+
+
 def test_operator_heartbeat_rejects_bad_signature(config: GatewayConfig) -> None:
     app = build_app(config)
     with TestClient(app) as client:

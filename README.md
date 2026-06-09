@@ -7,7 +7,7 @@ batches.
 
 ## Self-serve testnet API key
 
-On the Forge testnet, customers mint their own API key — no signup, no shared
+On the Forge testnet, customers mint their own API key with no signup or shared
 secret:
 
 ```
@@ -27,7 +27,7 @@ the SSRF allow-list still applies.
 ## Operator heartbeat (no shared secret)
 
 External operators enter the routing catalog by signing a heartbeat with the
-sr25519 key behind their ss58 hotkey — no foundation token required. The shared
+sr25519 key behind their ss58 hotkey. No foundation token is required. The shared
 `INTERNAL_AUTH_TOKEN` is reserved for foundation/admin endpoints
 (`/internal/catalog`, `/internal/seal_batch`, the legacy `/internal/heartbeat`).
 
@@ -38,7 +38,7 @@ POST https://gateway.orogen.network/v1/operator/heartbeat
 Content-Type: application/json
 
 {
-  "heartbeat_json": "{\"version\":1,\"operator_ss58\":\"5...\",\"endpoint_url\":\"https://your-host\",\"models\":[\"mock-model-7b\"],\"price_per_million_tokens\":1500,\"geo_region\":\"US\"}",
+  "heartbeat_json": "{\"version\":1,\"operator_ss58\":\"5...\",\"endpoint_url\":\"https://your-host\",\"models\":[\"mock-model-7b\"],\"price_per_million_tokens\":1500,\"geo_region\":\"US\",\"receipt_pubkey_hex\":\"<64-hex ed25519 public key>\"}",
   "signature": "0x<128-hex sr25519 signature>"
 }
 ```
@@ -55,6 +55,10 @@ This matches `wallet-sdk-core` / `wallet-cli heartbeat-test` (`DOMAIN_HEARTBEAT`
 Always submit the exact bytes you signed; the gateway verifies the signature
 against the raw body, so any re-serialization (key reordering, whitespace)
 invalidates it.
+
+`receipt_pubkey_hex` binds the staked ss58 operator identity to the ed25519 key
+used by the worker to sign RFC-0001 receipts. Without it the operator can be
+listed in the catalog, but the gateway cannot safely verify routed completions.
 
 Set `GATEWAY_REQUIRE_ONCHAIN_OPERATOR=true` to additionally require that the
 operator is registered/staked on-chain (`OperatorStake.Operators`) before

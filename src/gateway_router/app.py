@@ -96,11 +96,33 @@ class OperatorHeartbeatRequest(BaseModel):
     JSON key ordering can never desync sign and verify). It MUST decode to an
     object carrying at least `operator_ss58`; the gateway also reads optional
     routing fields (`endpoint_url`, `models`, `price_per_million_tokens`,
-    `geo_region`) so the operator can advertise what it serves.
+    `geo_region`, `receipt_pubkey_hex`) so the operator can advertise what it
+    serves and which ed25519 key signs receipts for that staked identity.
     """
 
     heartbeat_json: str
     signature: str
+
+
+def _receipt_pubkey_from_payload(payload: dict[str, Any]) -> str | None:
+    raw = (
+        payload.get("receipt_pubkey_hex")
+        or payload.get("operator_receipt_pubkey_hex")
+        or payload.get("operator_ed25519_pubkey_hex")
+        or ""
+    )
+    pubkey = str(raw).strip()
+    if not pubkey:
+        return None
+    if pubkey.startswith("0x"):
+        pubkey = pubkey[2:]
+    try:
+        bytes.fromhex(pubkey)
+    except ValueError as exc:
+        raise ValueError("receipt_pubkey_hex must be hex") from exc
+    if len(pubkey) != 64:
+        raise ValueError("receipt_pubkey_hex must be a 32-byte ed25519 public key")
+    return pubkey
 
 
 def _allow_http_localhost() -> bool:
@@ -297,6 +319,15 @@ def build_app(config: GatewayConfig) -> FastAPI:
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="models must be a list of base_model_id strings",
             )
+        try:
+            receipt_pubkey = _receipt_pubkey_from_payload(payload)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+        if receipt_pubkey is not None:
+            registry.register(operator_ss58, receipt_pubkey)
         capabilities = [
             Capability(base_model_id=str(m)) for m in models if str(m).strip()
         ]
@@ -313,6 +344,7 @@ def build_app(config: GatewayConfig) -> FastAPI:
             "operator_id": operator_ss58,
             "operators": len(catalog.all()),
             "advertised_models": sorted({c.base_model_id for c in capabilities}),
+            "receipt_pubkey_registered": receipt_pubkey is not None,
             "verified_at_ms": int(time.time() * 1000),
         }
 
